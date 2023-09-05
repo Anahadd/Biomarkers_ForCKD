@@ -1,15 +1,16 @@
+options(scipen = 999)
+
 library(GEOquery)
 library(preprocessCore)
 library(sva)
-library(randomForest) 
+library(randomForest)  # Add the randomForest package
+library(pheatmap)
 library(ggplot2)
 library(limma)
-library(AnnotationDbi)
-library(pheatmap)
-library(caret)
-library(knitr)
 library(glmnet)
-library(pROC)
+library(caret)
+library(dplyr)
+library(caret)
 
 # Get DataSet from GEO Database
 gse <- getGEO("GSE66494", GSEMatrix = TRUE)
@@ -17,7 +18,7 @@ gse <- getGEO("GSE66494", GSEMatrix = TRUE)
 # Get the Labels (possible future use)
 gseData <- pData(gse[[1]])
 
-# creating labels for the train dataset
+# creating labels for the train dataset 
 statustrain <- c(
   rep(1, 47),
   rep(0, 5)
@@ -41,6 +42,8 @@ Test_cols <- sample_names[54:ncol(Expr_GSM1623299)]
 Train <- Expr_GSM1623299[, Train_cols, drop = FALSE]
 Test <- Expr_GSM1623299[, Test_cols, drop = FALSE]
 
+#----------------------
+
 # Fetch the GEO dataset by accession number
 geo_data <- getGEO("GPL6480")
 
@@ -49,6 +52,8 @@ data_table <- geo_data@dataTable@table
 
 # Create a data frame from the platform data
 database <- data.frame(ID = geo_data@dataTable@table$ID, GENE = geo_data@dataTable@table$GENE, GENE_SYMBOL = geo_data@dataTable@table$GENE_SYMBOL)
+
+#------------------------
 
 # Normalize Data
 Train_normalized <- normalize.quantiles(Train)
@@ -71,19 +76,19 @@ colnames(Train_normalized_log2) <- paste(colnames(Train_normalized_log2), status
 # Add disease status as col names for the Test_normalized_log2 dataset
 colnames(Test_normalized_log2) <- paste(colnames(Test_normalized_log2), statustest, sep = "")
 
-# num of columns
+# num of columns 
 num_samples <- ncol(Train_normalized_log2)
 nSamplesTest <- ncol(Test_normalized_log2)
 
-# creating batches
+# creating batches 
 batch_indicator_train <- factor(rep(c("Batch1", "Batch2"), each = num_samples / 2))
 batch_indicator_test <- factor(rep(c("Batch1Test", "Batch2test"), each = nSamplesTest / 2))
 
-set.seed(123) # For reproducibility
+set.seed(123)  # For reproducibility
 random_order <- sample(1:num_samples)
 randomTest <- sample(1:nSamplesTest)
 batch_indicator_train <- batch_indicator_train[random_order]
-batch_indicator_test <- batch_indicator_test[randomTest]
+batch_indicator_test <- batch_indicator_test[randomTest] 
 
 # randomizing the test labels with the dataset (future use)
 status_Testshuffled = statustest[randomTest]
@@ -95,34 +100,49 @@ status_Trainshuffled = statustrain[random_order]
 corrected_train <- ComBat(dat = Train_normalized_log2[, random_order], batch = batch_indicator_train)
 corrected_test <- ComBat(dat = Test_normalized_log2[, randomTest], batch = batch_indicator_test)
 
-View(corrected_train)
-View(corrected_test)
+# Mapping the rownames of corrected_train to gene symbols
+corrected_train_gene_symbols <- corrected_train
+rownames(corrected_train_gene_symbols) <- database$GENE_SYMBOL[match(rownames(corrected_train), database$ID)]
+
+# Mapping the rownames of corrected_test to gene symbols
+corrected_test_gene_symbols <- corrected_test
+rownames(corrected_test_gene_symbols) <- database$GENE_SYMBOL[match(rownames(corrected_test), database$ID)]
+
+# Calculate variance for each gene
+gene_variance <- apply(corrected_train_gene_symbols, 1, var)
+
+# For each duplicated gene symbol, retain the one with the highest variance
+corrected_train_gene_symbols <- corrected_train_gene_symbols[order(-gene_variance),]
+corrected_train_gene_symbols <- corrected_train_gene_symbols[!duplicated(rownames(corrected_train_gene_symbols)),]
+
+# Repeat for test data
+gene_variance_test <- apply(corrected_test_gene_symbols, 1, var)
+corrected_test_gene_symbols <- corrected_test_gene_symbols[order(-gene_variance_test),]
+corrected_test_gene_symbols <- corrected_test_gene_symbols[!duplicated(rownames(corrected_test_gene_symbols)),]
+
+#---------------------
 
 # Create a design matrix for the linear model
 design_matrix <- model.matrix(~ status_Trainshuffled)
 
 # Perform differential expression analysis using limma
-fit <- lmFit(corrected_train, design_matrix)
+fit <- lmFit(corrected_train_gene_symbols, design_matrix)
 fit <- eBayes(fit)
 
 # Define the criteria for DEGs
-# We're looking for genes with FDR < 0.05 and absolute log2 fold change > 1
+# Were looking for genes with FDR < 0.05 and absolute log2 fold change > 2
+
 p_value_filter <- fit$p.value[, "status_Trainshuffled"] < 0.01
 coefficient_filter <- abs(fit$coefficients[, "status_Trainshuffled"]) > 1
 
 de_genes_indices <- which(p_value_filter & coefficient_filter)
 
 # Extract the differentially expressed genes from the corrected_train dataset
-de_genes_expression <- corrected_train[de_genes_indices, ]
+de_genes_expression <- corrected_train_gene_symbols[de_genes_indices, ]
 
-cat("Number of DEGs:", length(de_genes_indices), "\n")
+#cat("Number of DEGs:", length(de_genes_indices), "\n")
 
-# Print the gene names and coefficients of DEGs
-for (i in 1:nrow(de_genes_expression)) {
-  gene_name <- rownames(de_genes_expression)[i]
-  coefficient <- fit$coefficients[gene_name, "status_Trainshuffled"]
-  cat("Gene:", gene_name, " | Coefficient:", coefficient, "\n")
-}
+#--------------------
 
 # Create a data frame for the volcano plot
 volcano_data <- data.frame(
@@ -132,29 +152,27 @@ volcano_data <- data.frame(
 )
 
 # Define the color scheme
-volcano_data$Color <- ifelse(volcano_data$Coefficient > 4, "green",
-                             ifelse(volcano_data$Coefficient < -4, "red", "grey"))
+volcano_data$Color <- ifelse(volcano_data$Coefficient > 3.5, "green",
+                             ifelse(volcano_data$Coefficient < -3.5, "red", "grey"))
 
-# Create the volcano plot with labeled genes
+# Create the volcano plot
 volcano_plot <- ggplot(volcano_data, aes(x = Coefficient, y = -log10(PValue), color = Color)) +
   geom_point() +
-  geom_text(data = volcano_data[abs(volcano_data$Coefficient) > 4, ], 
-            aes(label = Gene), hjust = 0.5, vjust = -1, size = 2.5, nudge_y = 0.2) +  # Adding gene labels
   scale_color_identity() +
   labs(x = "Log2 Fold Change", y = "-log10(P-value)",
        title = "Volcano Plot of Differentially Expressed Genes") +
   theme_minimal()
 
 # Add labels to the green and red dots
-volcano_plot_with_labels <- volcano_plot +
-  geom_text(data = subset(volcano_data, Color %in% c("green", "red")),
-            aes(label = Gene), hjust = 0, vjust = 0)
+#volcano_plot_with_labels <- volcano_plot +
+#geom_text(data = subset(volcano_data, Color %in% c("green", "red")),
+#aes(label = Gene), hjust = 0, vjust = 0)
 
-# Print the volcano plot with labeled genes
+# Print the volcano plot
 print(volcano_plot)
 
 # Filter genes that are up-regulated or down-regulated
-regulated_genes <- de_genes_expression[abs(volcano_data$Coefficient) > 4, ]
+regulated_genes <- de_genes_expression[abs(volcano_data$Coefficient) > 3.5, ]
 
 # Select the expression values of the regulated genes
 regulated_gene_expression <- regulated_genes[, 1:ncol(regulated_genes)]
@@ -167,78 +185,107 @@ pheatmap(regulated_gene_expression,
          main = "Heatmap of Up/Down-Regulated Genes",
          fontsize = 8)
 
+#---------------------------------
 
-# Sort DEGs by p-value and fold change
-sorted_de_genes <- de_genes_expression[order(fit$p.value[de_genes_indices, "status_Trainshuffled"], decreasing = FALSE), ]
+# Extracting DEGs based on coefficient value
+DEGs <- volcano_data$Gene[abs(volcano_data$Coefficient) > 3.5]
 
-# Select the top 30 genes with the smallest p-values
-top_de_genes <- sorted_de_genes[1:30, ]
+# Transpose the datasets
+transposed_train_data <- t(corrected_train_gene_symbols)
+transposed_test_data <- t(corrected_test_gene_symbols)
 
-# Print the number of selected top DEGs
-cat("Number of Top DEGs:", nrow(top_de_genes), "\n")
+# Filter to DEGs
+train_subset <- transposed_train_data[, DEGs]
+test_subset <- transposed_test_data[, DEGs]
 
-# Print the gene symbols of the top DEGs
-gene_symbols <- rownames(top_de_genes)
-cat("Top Differentially Expressed Genes:\n")
-cat(paste(gene_symbols, collapse = ", "), "\n")
+# Check for any missing genes in the test dataset and fill them with median values from the training data
+missing_genes <- setdiff(DEGs, colnames(test_subset))
+for (gene in missing_genes) {
+  test_subset[, gene] <- median(train_subset[, gene], na.rm = TRUE)
+}
 
-# This column should contain gene symbols or IDs
-gene_symbols <- rownames(de_genes_expression)
-
-# If the gene symbols are the row names, you can directly use them
-gene_names <- gene_symbols
-
-# Feature Selection using Lasso Regression (glmnet package)
-lasso_model <- cv.glmnet(as.matrix(t(corrected_train)), status_Trainshuffled, alpha = 1)
-lasso_selected_genes <- coef(lasso_model, s = "lambda.min")
-
-# Convert coefficient matrix to a vector of selected gene names
-selected_gene_indices <- which(lasso_selected_genes != 0)
-corrected_train_subset <- corrected_train[selected_gene_indices, ]
-
-corrected_train_subset[is.na(corrected_train_subset)] <- 0
-
-# Feature Selection using Recursive Feature Elimination (RFE) and Random Forest
-# Note: This section requires the training dataset to be loaded as "corrected_train"
+# Train the Random Forest model
 set.seed(123)  # For reproducibility
-rfe_control <- rfeControl(functions = rfFuncs, method = "cv", number = 10)
-num_features <- ncol(corrected_train_subset)
-rfe_result <- rfe(t(corrected_train_subset), status_Trainshuffled, sizes = 1:num_features, rfeControl = rfe_control)
+rf_model <- randomForest(x = train_subset, y = as.factor(status_Trainshuffled), importance=TRUE)
 
-# Get the optimal features selected by RFE
-selected_rfe_genes <- selected_rfe_genes[rfe_result$optVariables]
+# Test the Random Forest model
+rf_predictions <- predict(rf_model, test_subset)
 
-# Random Forest for Disease Risk Prediction Model
-# Grid Search for the best mtry parameter
-set.seed(123)  # For reproducibility
-mtry_grid <- expand.grid(mtry = c(2, 5, 10, 20))
-rf_model <- train(corrected_train[, selected_rfe_genes], status_Trainshuffled, method = "rf", trControl = trainControl(method = "cv", number = 10), tuneGrid = mtry_grid)
+# Print model predictions and actual status side by side for validation set
+predictions_df <- data.frame(Predicted = rf_predictions, Actual = status_Testshuffled)
+print(predictions_df)
 
-# Optimal mtry value
-optimal_mtry <- rf_model$bestTune$mtry
+# Calculate Accuracy
+accuracy <- sum(rf_predictions == as.factor(status_Testshuffled)) / length(status_Testshuffled)
+print(paste("Accuracy on test data:", round(accuracy * 100, 2), "%"))
 
-# Building the Random Forest Model
-set.seed(123)  # For reproducibility
-final_rf_model <- randomForest(corrected_train[, selected_rfe_genes], status_Trainshuffled, mtry = optimal_mtry)
+#----------------------------------------------------
 
-# Model Evaluation on Training Data
-predicted_status <- predict(final_rf_model, corrected_train[, selected_rfe_genes])
-confusion_matrix <- confusionMatrix(predicted_status, status_Trainshuffled)
-accuracy <- confusion_matrix$overall["Accuracy"]
-auc <- roc(status_Trainshuffled, final_rf_model$votes[, "1"])$auc
+# If you want to see the importance of each gene in the model:
+important_genes <- importance(rf_model)
+important_genes_sorted <- important_genes[order(-important_genes[, "MeanDecreaseGini"]),]
 
-# Model Evaluation on Validation Data
-# Assuming you have loaded and preprocessed validation datasets
-predicted_status_val <- predict(final_rf_model, corrected_validation[, selected_rfe_genes])
-confusion_matrix_val <- confusionMatrix(predicted_status_val, status_validation)
-accuracy_val <- confusion_matrix_val$overall["Accuracy"]
-auc_val <- roc(status_validation, final_rf_model$votes_val[, "1"])$auc
+# Extracting top 20 important genes for visualization
+top_20_genes <- head(important_genes_sorted, 20)
+barplot(top_20_genes[,"MeanDecreaseGini"], 
+        las = 2, 
+        names.arg = rownames(top_20_genes), 
+        main = "Top 20 Important Genes", 
+        col = "steelblue", 
+        cex.names = 0.7, 
+        horiz = TRUE)
 
-# Print evaluation results
-cat("Training Data:\n")
-cat("Accuracy:", accuracy, "\n")
-cat("AUC:", auc, "\n\n")
+#----------------------------------------------------
 
-cat("Validation Data:\n")
-cat("Accuracy:", accuracy_val, "\n")
-cat("AUC:", auc_val, "\n")
+# Set up k-fold cross-validation
+control <- trainControl(method="cv", 
+                        number=10,  # 10-fold CV
+                        search="grid",
+                        classProbs = TRUE,
+                        summaryFunction=twoClassSummary)
+
+# Ensure response variable is a factor
+status_Trainshuffled <- as.factor(status_Trainshuffled)
+levels(status_Trainshuffled) <- c("Class0", "Class1")
+
+# Train the model with cross-validation
+set.seed(123)
+model_cv <- train(train_subset, status_Trainshuffled, 
+                  method="rf", 
+                  trControl=control, 
+                  metric="Accuracy",
+                  importance=TRUE)
+
+# Predict using the cross-validated model
+rf_predictions_CV <- predict(model_cv, test_subset)
+
+# Convert to factor and ensure consistent levels
+rf_predictions_CV <- factor(rf_predictions_CV, levels=c("Class0", "Class1"))
+
+# Convert 0 to Class0 and 1 to Class1 in status_Testshuffled
+status_Testshuffled <- ifelse(status_Testshuffled == 0, "Class0", "Class1")
+
+# Print model predictions and actual status side by side for validation set
+predictions_df_CV <- data.frame(Predicted = rf_predictions_CV, Actual = status_Testshuffled)
+print(predictions_df_CV)
+
+# Now calculate the accuracy
+accuracy_cv <- sum(rf_predictions_CV == status_Testshuffled) / length(status_Testshuffled)
+print(paste("Accuracy on test data with CV:", round(accuracy_cv * 100, 2), "%"))
+
+#----------------------------------------------------
+
+# Extracting important genes for the cross-validated model
+important_genes_cv <- model_cv$finalModel$importance
+important_genes_sorted_cv <- important_genes_cv[order(-important_genes_cv[, "MeanDecreaseGini"]),]
+
+# Extracting top 20 important genes for visualization
+top_20_genes_cv <- head(important_genes_sorted_cv, 20)
+barplot(top_20_genes_cv[,"MeanDecreaseGini"], 
+        las = 2, 
+        names.arg = rownames(top_20_genes_cv), 
+        main = "Top 20 Important Genes (Cross-validated Model)", 
+        col = "slateblue3", 
+        cex.names = 0.7, 
+        horiz = TRUE)
+
